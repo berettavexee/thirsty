@@ -1,5 +1,4 @@
-[![GitHub stars](https://img.shields.io/github/stars/jsleroy/thirsty.svg?style=social)](https://github.com/jsleroy/thirsty/stargazers)
-
+[![GitHub stars](https://img.shields.io/github/stars/berettavexee/thirsty.svg?style=social)](https://github.com/berettavexee/thirsty/stargazers)
 <p align="center">
 <img src="docs/assets/logo.png" alt="Thirsty Logo" width="200"/>
 </p>
@@ -8,15 +7,12 @@
 
 Add hydration points to your GPX tracks automatically 🚴‍♂️💧
 
-<p align="center">
-<a href="https://www.paypal.com/donate/?business=TJAXC3T4WD66L&no_recurring=0&currency_code=EUR" target="_blank">
-<img src="https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge" alt="Donate with PayPal"/>
-</a>
-</p>
+Thirsty is a Python tool that enhances your GPX files by adding Points of Interest (POIs), particularly drinking water and foods points, to your cycling or running routes. It integrates with the Overpass API to query OpenStreetMap for relevant points along your route and adds them to the GPX file. Ideal for long-distance cycling events, ultra races, or any activity where hydration points matter!
 
-Thirsty is a Python tool that enhances your GPX files by adding Points of Interest (POIs), particularly drinking water points, to your cycling or running routes. It integrates with the Overpass API to query OpenStreetMap for relevant points along your route and adds them to the GPX file. Ideal for long-distance cycling events, ultra races, or any activity where hydration points matter!
+This script is a fork of the original script from [jsleroy](https://github.com/jsleroy/thirsty/).
 
-Found a bug? Need a new feature? [Open an Issue](https://github.com/jsleroy/thirsty/issues)!
+This version allows you to process a GPX file containing 30,000 points and a route of over 1,000 kilometers in less than a minute on most computers.
+This is a niche use case that should only concern people preparing for multi-day ultracycling events. 
 
 ## 📷 Screenshots
 
@@ -47,9 +43,15 @@ Found a bug? Need a new feature? [Open an Issue](https://github.com/jsleroy/thir
 - **In-Memory Handling**: No need for temporary files; everything is handled in memory for speed.
 - **Progress Bar**: Monitor download and processing progress with the `rich` module.
 
+## Additional feature
+
+- **Ultra distance**: Support for routes covering thousands of kilometers.
+- **Bakery, Café, and Pizza robot**: more points of interest supported.
+
+
 ## POI Type Selection
 
-By default, **Thirsty** searches for public drinking water fountains (`drinking_water` POIs).
+By default, **Thirsty** searches for all supported POIs.
 You can customize which types of potable water points you want to add using the `--poi-type` (or `-p`) option.
 
 - You can specify **one or more** POI types by repeating the `-p` option.
@@ -64,6 +66,12 @@ You can customize which types of potable water points you want to add using the 
 | `water_tap`      | Taps providing potable water.                                          |
 | `spring`         | Natural springs with potable water.                                   |
 | `fountain`       | Public decorative fountains explicitly marked as potable.             |
+| `bakery`         | Bakery                                                                |
+| `cafe`           | Cafe                                                                  |
+| `fuel_convenience`| Gas station with a convenience store                                 |
+| `convenience_store`| Conveniance store                                                   |
+| `pizza_vending`  | 24-hour pizza vending machine                                         |
+
 
 ### Example usage
 
@@ -85,7 +93,7 @@ If an invalid POI type is provided, the program will display an error message an
 Clone this repository and set up a virtual environment:
 
 ```bash
-git clone https://github.com/jsleroy/thirsty
+git clone https://github.com/berettavexee/thirsty
 cd thirsty
 python3 -m venv venv
 source venv/bin/activate
@@ -132,6 +140,14 @@ thirsty input.gpx output.gpx --distance 150
 #### 4. Progress Bar
 - During the download process, the script shows a progress bar (using the `rich` library) so you can track the download status in real-time.
 
+#### 5. Bounding Box split 
+- The Overpass API does not allow queries on very large areas or returning very long lists of results. Areas that are too large are recursively divided into sub-areas.
+- Only sub-areas through which the route passes are requested via the overpass API.
+- The initial search area (Bounding Box) has been expanded to take into account the search radius. Important if you want to set up large search radius.
+
+#### 6. KD tree 
+- A KD Tree is used to quickly find the nearest neighbor before calculating the distance between a POI and the route. This is an important optimization for long routes.
+
 ## ️ Development
 
 ### Requirements
@@ -140,6 +156,7 @@ thirsty input.gpx output.gpx --distance 150
 - `requests`: For HTTP requests to Overpass API and downloading GPX files.
 - `gpxpy`: For reading and writing GPX files.
 - `rich`: For the progress bar and rich text output.
+- `scipy`: For faster filtering (KD Tree)
 
 ### Install Dependencies
 

@@ -1,3 +1,6 @@
 *.gpx
 *.html
 venv/
+build/
+thirsty.egg-info/
+thirsty/__pycache__/

@@ -1,3 +1,14 @@
+## v0.1.1 (2025-05-29)
+
+### Fix
+- Case of the track point at the edge of the initial bounding box
+
+### Refactor
+- Bounding Boxes Split
+- KD Tree
+- More Food POI
+
+
 ## v0.1.0 (2025-04-29)
 
 ### Fix

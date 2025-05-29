@@ -11,6 +11,7 @@ setup(
         "requests==2.32.3",
         "rich==14.0.0",
         "folium==0.19.5",
+        "scipy==1.13.0",
     ],
     entry_points={
         "console_scripts": [
