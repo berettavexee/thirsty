@@ -16,7 +16,7 @@ This is a niche use case that should only concern people preparing for multi-day
 
 ## 📷 Screenshots
 
-### Add Water Points to Your GPX
+### Add points of interest to Your GPX
 
 <p align="center">
 <img src="docs/assets/before-after.png" alt="Before" width="80%"/>
