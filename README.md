@@ -55,7 +55,7 @@ By default, **Thirsty** searches for all supported POIs.
 You can customize which types of potable water points you want to add using the `--poi-type` (or `-p`) option.
 
 - You can specify **one or more** POI types by repeating the `-p` option.
-- If no `-p` option is specified, `drinking_water` will be used automatically.
+- If no `-p` option is specified, All available POIs will be used automatically.
 
 ### Available POI types
 
