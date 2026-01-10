@@ -10,6 +10,7 @@ import re
 import folium
 import gpxpy
 import requests
+import time
 import rich.console
 import rich.progress
 from scipy.spatial import KDTree
@@ -17,7 +18,8 @@ from scipy.spatial import KDTree
 console = rich.console.Console()
 
 
-OVERPASS_URL = "http://overpass-api.de/api/interpreter"
+# OVERPASS_URL = "http://overpass-api.de/api/interpreter"
+OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
 # Environ 111.32 km par degré de latitud
 APPROX_DEGREES_PER_METER = 1 / 111320.0
 
@@ -190,7 +192,7 @@ def get_bounds(gpx, max_distance_m):
 
     # Compute angular margin use to expand the bounds
     approx_degrees_per_meter = 1 / 111320.0
-    angular_margin = max_distance_m * approx_degrees_per_meter * 1.5
+    angular_margin = max_distance_m * approx_degrees_per_meter * 1.05
 
     # Flag to check if any points were found
     found_points = False
@@ -318,21 +320,10 @@ def get_relevant_bboxes(bbox, gpx_kdtree, gpx_points_coords, max_bbox_area_sq_de
 
 def query_overpass(bbox, poi_types, gpx_kdtree):
     """
-    Generate an Overpass QL query for potable drinking water POIs,
-    handling large bounding boxes by subdividing them and checking for GPX track presence.
-
-    Args:
-        bbox (tuple): A tuple (south, west, north, east) representing the bounding box.
-        poi_types (list): A list of POI types (e.g., ["water", "fountain", "bakery"]).
-        gpx_kdtree (KDTree): KDTree of GPX track points.
-
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a POI.
+    Exécute une requête Overpass avec un maximum de 3 essais en cas d'erreur ou timeout.
     """
     south, west, north, east = bbox
-
     bbox_str = f"({south:.5f},{west:.5f},{north:.5f},{east:.5f})"
-    # console.print(f"  Executing Overpass query for bbox: {bbox_str}...")
 
     query_parts = []
     for poi_type in poi_types:
@@ -340,15 +331,28 @@ def query_overpass(bbox, poi_types, gpx_kdtree):
         query_parts.append(f'node{tag_filter}{bbox_str};')
 
     query = "[out:json][timeout:90];(" + "".join(query_parts) + ");out center;"
-    try:
-        response = requests.post(OVERPASS_URL, data=query, timeout=95)
-        response.raise_for_status()
-        elements = response.json()["elements"]
-        # console.print(f"  Found {len(elements)} elements in this bbox.")
-        return elements
-    except requests.exceptions.RequestException as e:
-        console.print(f"[bold red]Error during Overpass query: {e}[bold red]")
-        raise
+    
+    max_retries = 3
+    retry_delay = 10  # secondes
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f'Query Overpass {OVERPASS_URL} (Essai {attempt}/{max_retries}) : {query}')
+            response = requests.post(OVERPASS_URL, data=query, timeout=95)
+            response.raise_for_status()
+            
+            elements = response.json()["elements"]
+            return elements
+
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+            console.print(f"[bold yellow]Tentative {attempt} échouée: {e}[/bold yellow]")
+            
+            if attempt < max_retries:
+                console.print(f"Attente de {retry_delay}s avant le prochain essai...")
+                time.sleep(retry_delay)
+            else:
+                console.print(f"[bold red]Erreur définitive après {max_retries} essais.[/bold red]")
+                raise e
 
 
 def add_waypoints_to_gpx(gpx, pois):
@@ -470,7 +474,7 @@ def filter_pois_near_track(track_points_coords, kdtree, pois, max_distance_m=100
 
     nearby_pois = []
     approx_degrees_per_meter = 1 / 111320.0
-    kdtree_radius_degrees = max_distance_m * approx_degrees_per_meter * 1.5
+    kdtree_radius_degrees = max_distance_m * approx_degrees_per_meter * 1.05
 
     console.print(
         f"Filtering POIs near track (max_distance_m: {max_distance_m}m)...")
