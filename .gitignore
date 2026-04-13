@@ -1,5 +1,4 @@
 *.gpx
-*.html
 venv/
 build/
 thirsty.egg-info/

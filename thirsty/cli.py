@@ -25,7 +25,6 @@ def main():
         "-p",
         action="append",
         choices=list(thirsty.core.AMENITIES.keys()),
-        default=list(thirsty.core.AMENITIES.keys()),
         help=f"Type of POI to search for. Choose from: {', '.join(thirsty.core.AMENITIES.keys(
         ))}. Can be specified multiple times. Default: ALL available types."
     )
@@ -61,6 +60,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Set default POI types if none provided
+    if not args.poi_type:
+        args.poi_type = list(thirsty.core.AMENITIES.keys())
 
     gpx_input_path = args.gpx_input
     gpx_output_path = args.gpx_output

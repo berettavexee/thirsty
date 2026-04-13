@@ -8,18 +8,23 @@ import math
 import re
 
 import folium
+from folium.plugins import LocateControl
 import gpxpy
 import requests
 import time
 import rich.console
 import rich.progress
 from scipy.spatial import KDTree
+from rich.markup import escape
 
 console = rich.console.Console()
 
 
-# OVERPASS_URL = "http://overpass-api.de/api/interpreter"
-OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+]
 # Environ 111.32 km par degré de latitud
 APPROX_DEGREES_PER_METER = 1 / 111320.0
 
@@ -31,9 +36,9 @@ AMENITIES = {
     "fountain": "[amenity=fountain][drinking_water=yes]",
     "bakery": "[shop=bakery]",
     "cafe": "[amenity=cafe]",
-    "fuel_convenience": "[amenity=fuel][shop=convenience]",
+    "fuel_convenience": "[amenity=fuel]",
     "convenience_store": "[shop=convenience]",
-    "pizza_vending": "[amenity=vending_machine][vending=pizza]",
+    "pizza_vending": "[amenity=vending_machine]",
 }
 
 
@@ -60,6 +65,7 @@ def display_gpx_on_map(data, pois, bboxes_to_display=None):  # Ajout de bboxes_t
 
     map_center = [center_lat, center_lon]
     folium_map = folium.Map(location=map_center, zoom_start=12)
+    LocateControl(auto_start=False).add_to(folium_map)
 
     # Plot the GPX track on the map
     for track in data.tracks:
@@ -117,15 +123,15 @@ def display_gpx_on_map(data, pois, bboxes_to_display=None):  # Ajout de bboxes_t
         elif amenity_tag == 'cafe':
             icon_color = "darkred"
             icon_name = "coffee"
-        elif amenity_tag == 'fuel' and shop_tag == 'convenience':
+        elif amenity_tag == 'fuel':
             icon_color = "orange"
-            icon_name = "gas-pump"
-        elif shop_tag == 'convenience' and amenity_tag != 'fuel':
+            icon_name = "car"
+        elif shop_tag == 'convenience':
             icon_color = "purple"
             icon_name = "shopping-cart"
-        elif amenity_tag == 'vending_machine' and vending_tag == 'pizza':
+        elif amenity_tag == 'vending_machine':
             icon_color = "darkred"
-            icon_name = "pizza-slice"
+            icon_name = "shopping-basket"
 
         # Créer le contenu du popup de manière robuste
         poi_name = poi['tags'].get('name', 'POI sans nom')
@@ -140,7 +146,9 @@ def display_gpx_on_map(data, pois, bboxes_to_display=None):  # Ajout de bboxes_t
         elif man_made_tag:
             poi_type_display = man_made_tag
         elif vending_tag:
-            poi_type_display = f"vending_machine ({vending_tag})"
+            poi_type_display = f"vending ({vending_tag})"
+        elif amenity_tag == 'vending_machine':
+            poi_type_display = 'vending machine'
         else:
             poi_type_display = 'Type inconnu'
 
@@ -320,38 +328,49 @@ def get_relevant_bboxes(bbox, gpx_kdtree, gpx_points_coords, max_bbox_area_sq_de
 
 def query_overpass(bbox, poi_types, gpx_kdtree):
     """
-    Exécute une requête Overpass avec un maximum de 3 essais en cas d'erreur ou timeout.
+    Generate an Overpass QL query
+    
+    Args:
+        bbox (tuple): A tuple (south, west, north, east) representing the bounding box.
+        poi_types (list): A list of POI types (e.g., ["water", "fountain", "bakery"]).
+        gpx_kdtree (KDTree): KDTree of GPX track points.
+
+    Returns:
+        list: A list of dictionaries, where each dictionary represents a POI.
     """
     south, west, north, east = bbox
-    bbox_str = f"({south:.5f},{west:.5f},{north:.5f},{east:.5f})"
+    bbox_str = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
 
     query_parts = []
     for poi_type in poi_types:
         tag_filter = AMENITIES[poi_type]
-        query_parts.append(f'node{tag_filter}{bbox_str};')
+        query_parts.append(f'node{tag_filter};')
 
-    query = "[out:json][timeout:90];(" + "".join(query_parts) + ");out center;"
+    query = f"[out:json][timeout:90][bbox:{bbox_str}];(" + "".join(query_parts) + ");out center;"
     
-    max_retries = 3
-    retry_delay = 10  # secondes
+    max_retries = len(OVERPASS_ENDPOINTS) * 2
+    retry_delay = 5  # secondes
 
     for attempt in range(1, max_retries + 1):
+        # Cycle through endpoints
+        endpoint = OVERPASS_ENDPOINTS[(attempt - 1) % len(OVERPASS_ENDPOINTS)]
+        
         try:
-            print(f'Query Overpass {OVERPASS_URL} (Essai {attempt}/{max_retries}) : {query}')
-            response = requests.post(OVERPASS_URL, data=query, timeout=95)
+            console.print(f"Appel {attempt} : {endpoint} : {escape(query)}")
+            response = requests.post(endpoint, data=query, timeout=95)
             response.raise_for_status()
             
-            elements = response.json()["elements"]
+            elements = response.json().get("elements", [])
             return elements
 
-        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-            console.print(f"[bold yellow]Tentative {attempt} échouée: {e}[/bold yellow]")
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout, ValueError) as e:
+            console.print(f"[bold yellow]Tentative {attempt} échouée sur {endpoint}: {e}[/bold yellow]")
             
             if attempt < max_retries:
-                console.print(f"Attente de {retry_delay}s avant le prochain essai...")
+                console.print(f"Essai d'un autre serveur dans {retry_delay}s...")
                 time.sleep(retry_delay)
             else:
-                console.print(f"[bold red]Erreur définitive après {max_retries} essais.[/bold red]")
+                console.print(f"[bold red]Erreur définitive après {max_retries} essais sur tous les serveurs.[/bold red]")
                 raise e
 
 
@@ -380,18 +399,18 @@ def add_waypoints_to_gpx(gpx, pois):
             wpt.symbol = "meals"
             wpt.name = poi_name
             wpt.description = poi_name + " (Cafe)"
-        elif amenity_tag == 'fuel' and shop_tag == 'convenience':
+        elif amenity_tag == 'fuel':
             wpt.symbol = "gas"
             wpt.name = poi_name
-            wpt.description = poi_name + " (Fuel with Convenience Store)"
-        elif shop_tag == 'convenience' and amenity_tag != 'fuel':
+            wpt.description = poi_name + " (Fuel Station)"
+        elif shop_tag == 'convenience':
             wpt.symbol = "store"
             wpt.name = poi_name
             wpt.description = poi_name + " (Convenience Store)"
-        elif amenity_tag == 'vending_machine' and vending_tag == 'pizza':
+        elif amenity_tag == 'vending_machine':
             wpt.symbol = "pizza"
             wpt.name = poi_name
-            wpt.description = poi_name + " (Pizza Vending Machine)"
+            wpt.description = poi_name + " (Vending Machine)"
         elif amenity_tag in ['drinking_water', 'water_point', 'fountain'] or \
                 natural_tag == 'spring' or \
                 (man_made_tag == 'water_tap' and poi['tags'].get('drinking_water') == 'yes'):
@@ -503,7 +522,7 @@ def sanitize_gpx_text(data):
     return re.sub(r'&(?!amp;|quot;|lt;|gt;|apos;)', '&amp;', data)
 
 
-def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_sq_deg, lat_divisions, lon_divisions, show_bboxes=False):
+def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_sq_deg, lat_divisions, lon_divisions, show_bboxes=False, progress_callback=None):
     """
     Handles the core logic of parsing GPX, querying POIs, and filtering them.
 
@@ -515,11 +534,28 @@ def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_s
         lat_divisions (int): Latitude divisions for bbox subdivision.
         lon_divisions (int): Longitude divisions for bbox subdivision.
         show_bboxes (bool): If True, collect BBoxes used for Overpass queries.
+        progress_callback (callable): Optional callback function to report progress.
+                                     Called with dict containing: stage, current, total, poi_count
 
     Returns:
         tuple: (gpx_object, filtered_pois, collected_bboxes), where gpx_object is the parsed gpxpy.GPX object
                and filtered_pois is a list of dictionaries of POIs, and collected_bboxes is a list of BBoxes queried.
     """
+    # Helper function to safely call progress callback
+    def report_progress(stage, current=0, total=0, poi_count=0):
+        if progress_callback:
+            try:
+                progress_callback({
+                    'stage': stage,
+                    'current': current,
+                    'total': total,
+                    'poi_count': poi_count
+                })
+            except Exception as e:
+                console.print(f"[yellow]Warning: Progress callback error: {e}[/yellow]")
+    
+    # Stage 1: Parsing GPX
+    report_progress('Parsing GPX', 0, 5, 0)
     gpx_content = sanitize_gpx_text(gpx_content)
     gpx = gpxpy.parse(gpx_content)
     console.print("✅ Successfully parsed GPX data.")
@@ -550,6 +586,7 @@ def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_s
     console.print(f"Maximum bbox area: {max_bbox_area_sq_deg} sq deg (subdivision factor: {lat_divisions}x{lon_divisions})")
 
     # Find relevant bboxes
+    report_progress('Calculating bounding boxes', 1, 5, 0)
     bboxes = get_relevant_bboxes(
         bounds,
         gpx_kdtree,
@@ -566,21 +603,27 @@ def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_s
     # Initialiser la liste pour la collecte si show_bboxes est True
     collected_bboxes = bboxes if show_bboxes else None
 
-    # Find POIs
+    # Stage 2: Find POIs
     pois = []
-    for bbox in rich.progress.track(bboxes, description=f"[cyan]Querying Overpass for {len(poi_types)} POI types[/cyan]"):
+    for idx, bbox in enumerate(bboxes):
+        report_progress('Querying Overpass API', idx + 1, total_overpass_steps, len(pois))
         pois.extend(query_overpass(bbox, poi_types, gpx_kdtree))
 
     console.print(f"Total raw POIs found by Overpass: {len(pois)}")
 
-    # Remove duplicated POIs
+    # Stage 3: Remove duplicated POIs
+    report_progress('Deduplicating POIs', 3, 5, len(pois))
     deduplicated_pois = deduplicate_pois_by_id(pois)
     console.print(f"Total unique POIs after deduplication: {len(deduplicated_pois)}")
 
-    # Filter POIs
+    # Stage 4: Filter POIs
+    report_progress('Filtering POIs by distance', 4, 5, len(deduplicated_pois))
     filtered_pois = filter_pois_near_track(
         track_points_coords, gpx_kdtree, deduplicated_pois, max_distance_m)
     console.print(f"Total POIs within {max_distance_m}m of track: {len(filtered_pois)}")
+
+    # Stage 5: Complete
+    report_progress('Complete', 5, 5, len(filtered_pois))
 
     # Retourne également la liste des bboxes collectées
     return gpx, filtered_pois, collected_bboxes
