@@ -3,15 +3,20 @@ This module provides core functionalities for the Thirsty project,
 including GPX parsing, Overpass API queries, and POI filtering.
 """
 
+from __future__ import annotations
+
+import hashlib
 import io
+import json
 import math
 import re
+import time
+from pathlib import Path
 
 import folium
 from folium.plugins import LocateControl
 import gpxpy
 import requests
-import time
 import rich.console
 import rich.progress
 from scipy.spatial import KDTree
@@ -20,13 +25,63 @@ from rich.markup import escape
 console = rich.console.Console()
 
 
+CACHE_DIR = Path.home() / ".cache" / "thirsty" / "overpass"
+CACHE_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _cache_path(query: str) -> Path:
+    key = hashlib.sha256(query.encode()).hexdigest()
+    return CACHE_DIR / f"{key}.json"
+
+
+def _load_cache(query: str):
+    path = _cache_path(query)
+    if not path.exists():
+        return None
+    if time.time() - path.stat().st_mtime > CACHE_TTL_SECONDS:
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_cache(query: str, elements: list) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _cache_path(query).write_text(json.dumps(elements))
+
+
+def purge_cache() -> int:
+    if not CACHE_DIR.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for path in CACHE_DIR.glob("*.json"):
+        if now - path.stat().st_mtime > CACHE_TTL_SECONDS:
+            path.unlink()
+            removed += 1
+    return removed
+
+
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter"
 ]
-# Environ 111.32 km par degré de latitud
+
+# Approximate degrees per meter at mid-latitudes (111.32 km/degree).
 APPROX_DEGREES_PER_METER = 1 / 111320.0
+
+# Safety margins applied when converting metric distances to degree-space for KDTree queries.
+# 5 % extra so a POI at exactly max_distance_m is never dropped by floating-point rounding.
+_KDTREE_SEARCH_MARGIN = 1.05
+# 5 % dilation applied to each bbox before testing whether it contains GPX points.
+_BBOX_DILATION_FACTOR = 0.05
+# Additional radius factor for the KDTree ball query inside bbox containment check.
+_KDTREE_BBOX_RADIUS_MARGIN = 1.1
+
+# (south, west, north, east) in decimal degrees
+Bbox = tuple[float, float, float, float]
 
 AMENITIES = {
     "water": "[amenity=drinking_water]",
@@ -41,10 +96,73 @@ AMENITIES = {
     "pizza_vending": "[amenity=vending_machine]",
 }
 
+# Maps canonical POI class → Folium icon, GPX symbol, and human-readable label.
+_POI_STYLES: dict[str, dict] = {
+    "bakery":      {"icon_color": "green",   "icon_name": "cutlery",         "gpx_symbol": "food",       "label": "Bakery"},
+    "water":       {"icon_color": "blue",    "icon_name": "tint",            "gpx_symbol": "water-drop", "label": "Water"},
+    "cafe":        {"icon_color": "darkred", "icon_name": "coffee",          "gpx_symbol": "meals",      "label": "Cafe"},
+    "fuel":        {"icon_color": "orange",  "icon_name": "car",             "gpx_symbol": "gas",        "label": "Fuel Station"},
+    "convenience": {"icon_color": "purple",  "icon_name": "shopping-cart",   "gpx_symbol": "store",      "label": "Convenience Store"},
+    "vending":     {"icon_color": "darkred", "icon_name": "shopping-basket", "gpx_symbol": "pizza",      "label": "Vending Machine"},
+    "unknown":     {"icon_color": "darkblue","icon_name": "info-sign",       "gpx_symbol": "generic",    "label": None},
+}
 
-def display_gpx_on_map(data, pois, bboxes_to_display=None):  # Ajout de bboxes_to_display
-    """
-    Display the GPX route and POIs on a map, optionally with Overpass BBoxes.
+
+def classify_poi(poi: dict) -> str:
+    """Return the canonical class for a POI based on its Overpass tags."""
+    tags = poi.get("tags", {})
+    amenity = tags.get("amenity")
+    shop = tags.get("shop")
+    natural = tags.get("natural")
+    man_made = tags.get("man_made")
+
+    if shop == "bakery":
+        return "bakery"
+    if (amenity in ("drinking_water", "water_point", "fountain")
+            or natural == "spring"
+            or (man_made == "water_tap" and tags.get("drinking_water") == "yes")):
+        return "water"
+    if amenity == "cafe":
+        return "cafe"
+    if amenity == "fuel":
+        return "fuel"
+    if shop == "convenience":
+        return "convenience"
+    if amenity == "vending_machine":
+        return "vending"
+    return "unknown"
+
+
+def _poi_type_label(poi: dict) -> str:
+    """Human-readable type string for map popups and GPX descriptions."""
+    style = _POI_STYLES[classify_poi(poi)]
+    if style["label"]:
+        return style["label"]
+    tags = poi.get("tags", {})
+    for key in ("amenity", "shop", "natural", "man_made"):
+        val = tags.get(key)
+        if val:
+            return val.replace("_", " ").title()
+    vending = tags.get("vending")
+    if vending:
+        return f"Vending Machine: {vending.replace('_', ' ').title()}"
+    return "Type inconnu"
+
+
+def display_gpx_on_map(
+    data: gpxpy.gpx.GPX,
+    pois: list[dict],
+    bboxes_to_display: list[Bbox] | None = None,
+) -> folium.Map:
+    """Display the GPX route and POIs on a Folium map.
+
+    Args:
+        data: Parsed GPX object containing the track.
+        pois: List of Overpass POI elements (each with 'lat', 'lon', 'tags').
+        bboxes_to_display: Optional list of bboxes to draw as semi-transparent red rectangles.
+
+    Returns:
+        A Folium Map object ready to be saved as HTML.
     """
     if bboxes_to_display is None:
         bboxes_to_display = []
@@ -101,71 +219,19 @@ def display_gpx_on_map(data, pois, bboxes_to_display=None):  # Ajout de bboxes_t
 
     # Plot POIs on the map
     for poi in pois:
-        icon_color = "darkblue"
-        icon_name = "info-sign"
-
-        # Récupérer les tags pertinents de manière sécurisée
-        amenity_tag = poi['tags'].get('amenity')
-        shop_tag = poi['tags'].get('shop')
-        natural_tag = poi['tags'].get('natural')
-        man_made_tag = poi['tags'].get('man_made')
-        vending_tag = poi['tags'].get('vending')
-
-        # Logique pour déterminer la couleur et l'icône
-        if shop_tag == 'bakery':
-            icon_color = "green"
-            icon_name = "cutlery"
-        elif amenity_tag in ['drinking_water', 'water_point', 'fountain'] or \
-                natural_tag == 'spring' or \
-                (man_made_tag == 'water_tap' and poi['tags'].get('drinking_water') == 'yes'):
-            icon_color = "blue"
-            icon_name = "tint"
-        elif amenity_tag == 'cafe':
-            icon_color = "darkred"
-            icon_name = "coffee"
-        elif amenity_tag == 'fuel':
-            icon_color = "orange"
-            icon_name = "car"
-        elif shop_tag == 'convenience':
-            icon_color = "purple"
-            icon_name = "shopping-cart"
-        elif amenity_tag == 'vending_machine':
-            icon_color = "darkred"
-            icon_name = "shopping-basket"
-
-        # Créer le contenu du popup de manière robuste
+        style = _POI_STYLES[classify_poi(poi)]
         poi_name = poi['tags'].get('name', 'POI sans nom')
-
-        # Pour l'affichage dans le popup, on essaie de trouver le type le plus pertinent
-        if amenity_tag:
-            poi_type_display = amenity_tag
-        elif shop_tag:
-            poi_type_display = shop_tag
-        elif natural_tag:
-            poi_type_display = natural_tag
-        elif man_made_tag:
-            poi_type_display = man_made_tag
-        elif vending_tag:
-            poi_type_display = f"vending ({vending_tag})"
-        elif amenity_tag == 'vending_machine':
-            poi_type_display = 'vending machine'
-        else:
-            poi_type_display = 'Type inconnu'
-
         folium.Marker(
             location=[poi['lat'], poi['lon']],
-            popup=folium.Popup(
-                f"{poi_name}: {poi_type_display}", max_width=300),
-            icon=folium.Icon(color=icon_color, icon=icon_name, prefix='fa')
+            popup=folium.Popup(f"{poi_name}: {_poi_type_label(poi)}", max_width=300),
+            icon=folium.Icon(color=style["icon_color"], icon=style["icon_name"], prefix='fa')
         ).add_to(folium_map)
 
     return folium_map
 
 
-def download_gpx(url):
-    """
-    Download GPX from URL
-    """
+def download_gpx(url: str) -> io.BytesIO:
+    """Download GPX from URL."""
 
     console.print(f"⏳ Downloading GPX from {url}")
 
@@ -187,32 +253,30 @@ def download_gpx(url):
     return data
 
 
-def get_bounds(gpx, max_distance_m):
+def get_bounds(gpx: gpxpy.gpx.GPX, max_distance_m: float) -> Bbox | None:
+    """Return the bounding box of all GPX track points, expanded by max_distance_m.
+
+    Args:
+        gpx: Parsed GPX object.
+        max_distance_m: Search radius in metres; the bbox is expanded by this amount on each side.
+
+    Returns:
+        (south, west, north, east) in decimal degrees, or None if the track has no points.
     """
-    Return GPX trace bounding box [south, west, north, est]
-    Optimized to iterate over points only once.
-    """
-    # Initialize min/max values with extreme values
     min_lat = float('inf')
     max_lat = float('-inf')
     min_lon = float('inf')
     max_lon = float('-inf')
 
-    # Compute angular margin use to expand the bounds
-    approx_degrees_per_meter = 1 / 111320.0
-    angular_margin = max_distance_m * approx_degrees_per_meter * 1.05
+    angular_margin = max_distance_m * APPROX_DEGREES_PER_METER * _KDTREE_SEARCH_MARGIN
 
-    # Flag to check if any points were found
     found_points = False
-
     for trk in gpx.tracks:
         for seg in trk.segments:
             for pt in seg.points:
                 found_points = True
-                # Update min/max latitude
                 min_lat = min(min_lat, pt.latitude)
                 max_lat = max(max_lat, pt.latitude)
-                # Update min/max longitude
                 min_lon = min(min_lon, pt.longitude)
                 max_lon = max(max_lon, pt.longitude)
 
@@ -227,17 +291,16 @@ def get_bounds(gpx, max_distance_m):
     return min_lat, min_lon, max_lat, max_lon
 
 
-def _subdivide_bbox(bbox, lat_divisions, lon_divisions):
-    """
-    Subdivides a given bounding box into a grid of smaller bounding boxes.
+def _subdivide_bbox(bbox: Bbox, lat_divisions: int, lon_divisions: int) -> list[Bbox]:
+    """Subdivide a bounding box into a lat_divisions × lon_divisions grid.
 
     Args:
-        bbox (tuple): A tuple (south, west, north, east) representing the bounding box.
-        lat_divisions (int): Number of divisions along the latitude (rows).
-        lon_divisions (int): Number of divisions along the longitude (columns).
+        bbox: (south, west, north, east) bounding box to split.
+        lat_divisions: Number of rows (latitude cuts).
+        lon_divisions: Number of columns (longitude cuts).
 
     Returns:
-        list: A list of smaller bounding box tuples.
+        List of sub-bboxes in row-major order.
     """
     south, west, north, east = bbox
     sub_bboxes = []
@@ -255,59 +318,70 @@ def _subdivide_bbox(bbox, lat_divisions, lon_divisions):
     return sub_bboxes
 
 
-# max_distance_m retiré des paramètres
-def _bbox_contains_gpx_points(bbox, gpx_kdtree, gpx_points_coords):
-    """
-    Checks if a bounding box (with a 10% margin) contains any GPX track points.
+def _bbox_contains_gpx_points(
+    bbox: Bbox,
+    gpx_kdtree: KDTree,
+    gpx_points_coords: list[tuple[float, float]],
+) -> bool:
+    """Return True if bbox (dilated by _BBOX_DILATION_FACTOR) contains at least one GPX point.
 
     Args:
-        bbox (tuple): (south, west, north, east)
-        gpx_kdtree (KDTree): KDTree of GPX track points.
-        gpx_points_coords (list): List of (lat, lon) tuples for GPX points.
-
-    Returns:
-        bool: True if the bbox (with margin) contains at least one GPX point, False otherwise.
+        bbox: (south, west, north, east) bounding box to test.
+        gpx_kdtree: KDTree built from gpx_points_coords for fast spatial lookup.
+        gpx_points_coords: List of (lat, lon) tuples of all GPX track points.
     """
     south, west, north, east = bbox
 
-    # Calculer la marge de 10% de la taille de la bbox
-    lat_margin = (north - south) * 0.05
-    lon_margin = (east - west) * 0.05
+    lat_margin = (north - south) * _BBOX_DILATION_FACTOR
+    lon_margin = (east - west) * _BBOX_DILATION_FACTOR
 
-    # Dilater la bbox
     dilated_south = south - lat_margin
     dilated_north = north + lat_margin
     dilated_west = west - lon_margin
     dilated_east = east + lon_margin
 
-    # Calculer le centre de la BBox dilatée et sa diagonale pour la requête KDTree
     center_lat = (dilated_south + dilated_north) / 2
     center_lon = (dilated_west + dilated_east) / 2
 
     diagonal_lat_deg = dilated_north - dilated_south
     diagonal_lon_deg = dilated_east - dilated_west
-    approx_bbox_radius_deg = math.sqrt(
-        diagonal_lat_deg**2 + diagonal_lon_deg**2) / 2
+    approx_bbox_radius_deg = math.sqrt(diagonal_lat_deg**2 + diagonal_lon_deg**2) / 2
 
-    # Utiliser un rayon légèrement plus grand pour la requête KDTree afin d'être sûr de couvrir
-    # La marge de 1.1 est une précaution supplémentaire pour s'assurer que le KDTree couvre bien toute la zone dilatée.
     potential_indices = gpx_kdtree.query_ball_point(
-        [center_lat, center_lon], r=approx_bbox_radius_deg * 1.1)
+        [center_lat, center_lon], r=approx_bbox_radius_deg * _KDTREE_BBOX_RADIUS_MARGIN)
 
     for idx in potential_indices:
         lat, lon = gpx_points_coords[idx]
-        # Vérifier si le point GPX est dans la BBox DILATÉE
         if dilated_south <= lat <= dilated_north and dilated_west <= lon <= dilated_east:
             return True
 
     return False
 
 
-def get_relevant_bboxes(bbox, gpx_kdtree, gpx_points_coords, max_bbox_area_sq_deg=0.5, lat_divisions=2, lon_divisions=2):
-    """
-    Recursively counts the number of relevant bounding boxes that will be processed
-    (either queried directly or skipped due to no GPX points).
-    This count will be used as the 'total' for the rich progress bar.
+def get_relevant_bboxes(
+    bbox: Bbox,
+    gpx_kdtree: KDTree,
+    gpx_points_coords: list[tuple[float, float]],
+    max_bbox_area_sq_deg: float = 0.5,
+    lat_divisions: int = 2,
+    lon_divisions: int = 2,
+) -> list[Bbox]:
+    """Recursively subdivide bbox and return only the leaves that intersect the GPX track.
+
+    Bboxes smaller than max_bbox_area_sq_deg are returned as-is (leaf nodes).
+    Larger ones are split into a lat_divisions × lon_divisions grid and each
+    child is tested recursively. Bboxes with no GPX points are discarded early.
+
+    Args:
+        bbox: (south, west, north, east) root bounding box to process.
+        gpx_kdtree: KDTree built from gpx_points_coords.
+        gpx_points_coords: List of (lat, lon) tuples of all GPX track points.
+        max_bbox_area_sq_deg: Area threshold in square degrees below which a bbox is queried directly.
+        lat_divisions: Number of latitude splits when subdividing.
+        lon_divisions: Number of longitude splits when subdividing.
+
+    Returns:
+        List of leaf bboxes that overlap the GPX track and should be sent to Overpass.
     """
     south, west, north, east = bbox
     current_bbox_area = (north - south) * (east - west)
@@ -326,17 +400,22 @@ def get_relevant_bboxes(bbox, gpx_kdtree, gpx_points_coords, max_bbox_area_sq_de
     return bboxes
 
 
-def query_overpass(bbox, poi_types, gpx_kdtree):
-    """
-    Generate an Overpass QL query
-    
+def query_overpass(bbox: Bbox, poi_types: list[str], gpx_kdtree: KDTree) -> list[dict]:
+    """Query the Overpass API for POIs of the given types within bbox.
+
+    Results are cached on disk for CACHE_TTL_SECONDS. On failure the query is
+    retried across all OVERPASS_ENDPOINTS (2 full rotations before giving up).
+
     Args:
-        bbox (tuple): A tuple (south, west, north, east) representing the bounding box.
-        poi_types (list): A list of POI types (e.g., ["water", "fountain", "bakery"]).
-        gpx_kdtree (KDTree): KDTree of GPX track points.
+        bbox: (south, west, north, east) bounding box for the Overpass query.
+        poi_types: List of AMENITIES keys (e.g. ["water", "bakery"]).
+        gpx_kdtree: Unused directly here; reserved for future proximity pre-filtering.
 
     Returns:
-        list: A list of dictionaries, where each dictionary represents a POI.
+        List of Overpass element dicts, each with at least 'id', 'lat', 'lon', 'tags'.
+
+    Raises:
+        requests.exceptions.RequestException: If all retry attempts fail.
     """
     south, west, north, east = bbox
     bbox_str = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
@@ -348,24 +427,32 @@ def query_overpass(bbox, poi_types, gpx_kdtree):
 
     query = f"[out:json][timeout:90][bbox:{bbox_str}];(" + "".join(query_parts) + ");out center;"
     
+    cached = _load_cache(query)
+    if cached is not None:
+        console.print(f"[green]Cache hit pour bbox {bbox_str}[/green]")
+        return cached
+
     max_retries = len(OVERPASS_ENDPOINTS) * 2
     retry_delay = 5  # secondes
+    success_delay = 2 # secondes
 
     for attempt in range(1, max_retries + 1):
         # Cycle through endpoints
         endpoint = OVERPASS_ENDPOINTS[(attempt - 1) % len(OVERPASS_ENDPOINTS)]
-        
+
         try:
             console.print(f"Appel {attempt} : {endpoint} : {escape(query)}")
             response = requests.post(endpoint, data=query, timeout=95)
             response.raise_for_status()
-            
+
             elements = response.json().get("elements", [])
+            _save_cache(query, elements)
+            time.sleep(success_delay)
             return elements
 
         except (requests.exceptions.RequestException, requests.exceptions.Timeout, ValueError) as e:
             console.print(f"[bold yellow]Tentative {attempt} échouée sur {endpoint}: {e}[/bold yellow]")
-            
+
             if attempt < max_retries:
                 console.print(f"Essai d'un autre serveur dans {retry_delay}s...")
                 time.sleep(retry_delay)
@@ -374,73 +461,24 @@ def query_overpass(bbox, poi_types, gpx_kdtree):
                 raise e
 
 
-def add_waypoints_to_gpx(gpx, pois):
-    """
-    Add POI to GPX trace
-    """
+def add_waypoints_to_gpx(gpx: gpxpy.gpx.GPX, pois: list[dict]) -> gpxpy.gpx.GPX:
+    """Add POI waypoints to a GPX object and return it."""
 
     for poi in pois:
         wpt = gpxpy.gpx.GPXWaypoint()
         wpt.latitude = poi["lat"]
         wpt.longitude = poi["lon"]
-
-        poi_name = poi['tags'].get('name', 'POI sans nom')
-        amenity_tag = poi['tags'].get('amenity')
-        shop_tag = poi['tags'].get('shop')
-        natural_tag = poi['tags'].get('natural')
-        man_made_tag = poi['tags'].get('man_made')
-        vending_tag = poi['tags'].get('vending')
-
-        if shop_tag == 'bakery':
-            wpt.symbol = "food"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Bakery)"
-        elif amenity_tag == 'cafe':
-            wpt.symbol = "meals"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Cafe)"
-        elif amenity_tag == 'fuel':
-            wpt.symbol = "gas"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Fuel Station)"
-        elif shop_tag == 'convenience':
-            wpt.symbol = "store"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Convenience Store)"
-        elif amenity_tag == 'vending_machine':
-            wpt.symbol = "pizza"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Vending Machine)"
-        elif amenity_tag in ['drinking_water', 'water_point', 'fountain'] or \
-                natural_tag == 'spring' or \
-                (man_made_tag == 'water_tap' and poi['tags'].get('drinking_water') == 'yes'):
-            wpt.symbol = "water-drop"
-            wpt.name = poi_name
-            wpt.description = poi_name + " (Water)"
-        else:
-            wpt.symbol = "generic"
-            wpt.name = poi_name
-            if amenity_tag:
-                wpt.description = poi_name + \
-                    f" ({amenity_tag.replace('_', ' ').title()})"
-            elif shop_tag:
-                wpt.description = poi_name + \
-                    f" ({shop_tag.replace('_', ' ').title()})"
-            elif vending_tag:
-                wpt.description = poi_name + \
-                    f" (Vending Machine: {vending_tag.replace('_', ' ').title()})"
-            else:
-                wpt.description = poi_name + " (Unknown POI Type)"
-
+        style = _POI_STYLES[classify_poi(poi)]
+        wpt.name = poi['tags'].get('name', 'POI sans nom')
+        wpt.symbol = style["gpx_symbol"]
+        wpt.description = f"{wpt.name} ({_poi_type_label(poi)})"
         gpx.waypoints.append(wpt)
 
     return gpx
 
 
-def haversine(lat1, lon1, lat2, lon2):
-    """
-    Return distance in meter between two GPS points
-    """
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return distance in metres between two GPS coordinates."""
 
     R = 6371000  # Earth radius in meter
     phi1 = math.radians(lat1)
@@ -455,45 +493,56 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def deduplicate_pois_by_id(pois):
-    """
-    Removes duplicate POIs from a list using their unique Overpass ID.
+def deduplicate_pois_by_id(pois: list[dict]) -> list[dict]:
+    """Remove duplicate POIs using their Overpass element ID.
 
     Args:
-        pois (list): A list of dictionaries, where each dictionary represents a POI
-                     and must contain an 'id' key (the Overpass ID of the POI).
+        pois: Raw list of Overpass elements, possibly containing duplicates
+              when the same node appears in results from adjacent bboxes.
 
     Returns:
-        list: A new list of dictionaries, containing only the unique POIs.
+        New list keeping only the first occurrence of each unique 'id'.
     """
     console.print("⏳ Deduplicating POIs by Overpass ID...")
 
-    seen_ids = set()  # A set to store already seen POI IDs.
-    unique_pois = []  # The list that will hold the unique POIs.
+    seen_ids: set = set()
+    unique_pois: list[dict] = []
 
     for poi in rich.progress.track(pois, description="Deduplicating POIs"):
-        poi_id = poi.get('id')  # Retrieve the POI's ID.
+        poi_id = poi.get('id')
 
-        # Check if the ID has already been seen.
         if poi_id is not None and poi_id not in seen_ids:
-            unique_pois.append(poi)  # Add the POI to the unique list.
-            seen_ids.add(poi_id)      # Add the ID to the set of seen IDs.
+            unique_pois.append(poi)
+            seen_ids.add(poi_id)
         elif poi_id is None:
-            # Handle cases where a POI might not have an ID (unlikely with Overpass, but good practice)
-            console.log(f"[yellow]Warning: POI found without 'id' key. Skipping for deduplication: {poi}[/yellow]")
+            console.log(f"[yellow]Warning: POI without 'id' skipped: {poi}[/yellow]")
 
     console.print(f"✅ Deduplication complete. {len(unique_pois)} unique POIs out of {len(pois)} initial ones.")
     return unique_pois
 
 
-def filter_pois_near_track(track_points_coords, kdtree, pois, max_distance_m=100):
-    """
-    Keep only POI near trace using a KDTree for efficient proximity search.
-    """
+def filter_pois_near_track(
+    track_points_coords: list[tuple[float, float]],
+    kdtree: KDTree,
+    pois: list[dict],
+    max_distance_m: float = 100,
+) -> list[dict]:
+    """Return only the POIs within max_distance_m of at least one GPX track point.
 
-    nearby_pois = []
-    approx_degrees_per_meter = 1 / 111320.0
-    kdtree_radius_degrees = max_distance_m * approx_degrees_per_meter * 1.05
+    Uses a KDTree pre-filter in degree-space to reduce the number of exact
+    Haversine distance calculations.
+
+    Args:
+        track_points_coords: List of (lat, lon) tuples of all GPX track points.
+        kdtree: KDTree built from track_points_coords.
+        pois: Candidate POI list to filter.
+        max_distance_m: Maximum allowed distance in metres from the track.
+
+    Returns:
+        Subset of pois whose nearest track point is within max_distance_m.
+    """
+    nearby_pois: list[dict] = []
+    kdtree_radius_degrees = max_distance_m * APPROX_DEGREES_PER_METER * _KDTREE_SEARCH_MARGIN
 
     console.print(
         f"Filtering POIs near track (max_distance_m: {max_distance_m}m)...")
@@ -514,32 +563,39 @@ def filter_pois_near_track(track_points_coords, kdtree, pois, max_distance_m=100
     return nearby_pois
 
 
-def sanitize_gpx_text(data):
-    """
-    Fix GPX content by replacing unescaped '&' with '&amp;'
-    """
-
+def sanitize_gpx_text(data: str) -> str:
+    """Replace unescaped '&' with '&amp;' to produce valid GPX XML."""
     return re.sub(r'&(?!amp;|quot;|lt;|gt;|apos;)', '&amp;', data)
 
 
-def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_sq_deg, lat_divisions, lon_divisions, show_bboxes=False, progress_callback=None):
-    """
-    Handles the core logic of parsing GPX, querying POIs, and filtering them.
+def process_gpx_and_pois(
+    gpx_content: str,
+    poi_types: list[str],
+    max_distance_m: float,
+    max_bbox_area_sq_deg: float,
+    lat_divisions: int,
+    lon_divisions: int,
+    show_bboxes: bool = False,
+    progress_callback: callable | None = None,
+) -> tuple[gpxpy.gpx.GPX, list[dict], list[Bbox]]:
+    """Orchestrate the full pipeline: parse GPX → query Overpass → deduplicate → filter.
 
     Args:
-        gpx_content (str): The raw GPX content as a string.
-        poi_types (list): List of POI types to search for.
-        max_distance_m (int): Max distance for POI filtering.
-        max_bbox_area_sq_deg (float): Max area for Overpass query bbox.
-        lat_divisions (int): Latitude divisions for bbox subdivision.
-        lon_divisions (int): Longitude divisions for bbox subdivision.
-        show_bboxes (bool): If True, collect BBoxes used for Overpass queries.
-        progress_callback (callable): Optional callback function to report progress.
-                                     Called with dict containing: stage, current, total, poi_count
+        gpx_content: Raw GPX file content as a string.
+        poi_types: List of AMENITIES keys to search for.
+        max_distance_m: Maximum distance in metres from the track to retain a POI.
+        max_bbox_area_sq_deg: Overpass bboxes larger than this (in square degrees) are subdivided.
+        lat_divisions: Number of latitude splits when subdividing a large bbox.
+        lon_divisions: Number of longitude splits when subdividing a large bbox.
+        show_bboxes: When True, the returned bbox list is populated; otherwise it is empty.
+        progress_callback: Optional callable(dict) receiving progress updates with keys
+                           'stage', 'current', 'total', 'poi_count'.
 
     Returns:
-        tuple: (gpx_object, filtered_pois, collected_bboxes), where gpx_object is the parsed gpxpy.GPX object
-               and filtered_pois is a list of dictionaries of POIs, and collected_bboxes is a list of BBoxes queried.
+        Tuple (gpx, filtered_pois, queried_bboxes):
+            - gpx: Parsed gpxpy.GPX object (track only, no waypoints yet).
+            - filtered_pois: POIs within max_distance_m of the track.
+            - queried_bboxes: Bboxes sent to Overpass (empty if show_bboxes is False).
     """
     # Helper function to safely call progress callback
     def report_progress(stage, current=0, total=0, poi_count=0):
@@ -554,6 +610,10 @@ def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_s
             except Exception as e:
                 console.print(f"[yellow]Warning: Progress callback error: {e}[/yellow]")
     
+    removed = purge_cache()
+    if removed:
+        console.print(f"🗑️  Cache : {removed} fichier(s) expirés supprimés.")
+
     # Stage 1: Parsing GPX
     report_progress('Parsing GPX', 0, 5, 0)
     gpx_content = sanitize_gpx_text(gpx_content)
@@ -599,9 +659,7 @@ def process_gpx_and_pois(gpx_content, poi_types, max_distance_m, max_bbox_area_s
     console.print(
         f"Calculated {total_overpass_steps} Overpass query/skip steps.")
 
-    # Display bboxes for debug prupose
-    # Initialiser la liste pour la collecte si show_bboxes est True
-    collected_bboxes = bboxes if show_bboxes else None
+    collected_bboxes = bboxes if show_bboxes else []
 
     # Stage 2: Find POIs
     pois = []

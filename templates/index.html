@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thirsty - GPX POI Finder</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="title">
+                    <span class="icon">💧</span>
+                    Thirsty
+                </h1>
+                <p class="subtitle">Find Points of Interest Along Your GPX Route</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Upload Section -->
+            <section id="upload-section" class="card">
+                <h2 class="card-title">Upload GPX File</h2>
+                
+                <div id="drop-zone" class="drop-zone">
+                    <div class="drop-zone-content">
+                        <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                        </svg>
+                        <p class="drop-zone-text">Drag & drop your GPX file here</p>
+                        <p class="drop-zone-subtext">or click to browse</p>
+                        <input type="file" id="gpx-file-input" accept=".gpx" hidden>
+                    </div>
+                    <div id="file-info" class="file-info" style="display: none;">
+                        <span id="file-name"></span>
+                        <button id="remove-file" class="btn-remove">×</button>
+                    </div>
+                </div>
+
+                <!-- Configuration Form -->
+                <form id="config-form" style="display: none;">
+                    <div class="form-section">
+                        <h3 class="form-section-title">POI Types</h3>
+                        <div class="poi-grid">
+                            {% for key, value in amenities.items() %}
+                            <label class="poi-checkbox">
+                                <input type="checkbox" name="poi_types" value="{{ key }}" checked>
+                                <span class="poi-label">{{ key.replace('_', ' ').title() }}</span>
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3 class="form-section-title">Search Parameters</h3>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="max-distance">Max Distance (meters)</label>
+                                <input type="number" id="max-distance" name="max_distance" value="100" min="10" max="5000">
+                            </div>
+                            <div class="form-group">
+                                <label for="max-bbox-area">Max BBox Area (sq deg)</label>
+                                <input type="number" id="max-bbox-area" name="max_bbox_area" value="0.5" min="0.1" max="5" step="0.1">
+                            </div>
+                            <div class="form-group">
+                                <label for="lat-divisions">Latitude Divisions</label>
+                                <input type="number" id="lat-divisions" name="lat_divisions" value="2" min="1" max="10">
+                            </div>
+                            <div class="form-group">
+                                <label for="lon-divisions">Longitude Divisions</label>
+                                <input type="number" id="lon-divisions" name="lon_divisions" value="2" min="1" max="10">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="show-bboxes" name="show_bboxes">
+                                <span>Show bounding boxes on map</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <button type="submit" id="process-btn" class="btn-primary">
+                        <span class="btn-text">Find POIs</span>
+                        <span class="btn-loader" style="display: none;"></span>
+                    </button>
+                </form>
+            </section>
+
+            <!-- Results Section -->
+            <section id="results-section" class="card" style="display: none;">
+                <h2 class="card-title">Results</h2>
+                
+                <div id="results-summary" class="results-summary">
+                    <div class="stat-card">
+                        <div class="stat-value" id="poi-count">0</div>
+                        <div class="stat-label">POIs Found</div>
+                    </div>
+                </div>
+
+                <div id="map-container" class="map-container">
+                    <iframe id="map-frame" class="map-frame"></iframe>
+                </div>
+
+                <div class="download-buttons">
+                    <button id="download-gpx" class="btn-secondary">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        Download GPX
+                    </button>
+                    <button id="download-html" class="btn-secondary">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        Download Map
+                    </button>
+                </div>
+
+                <button id="new-search" class="btn-outline">Start New Search</button>
+            </section>
+
+            <!-- Loading Overlay -->
+            <div id="loading-overlay" class="loading-overlay" style="display: none;">
+                <div class="loading-content">
+                    <div class="spinner"></div>
+                    <p class="loading-text">Processing your GPX file...</p>
+                    <p class="loading-subtext">This may take a few moments</p>
+                    
+                    <!-- Progress Bar -->
+                    <div id="progress-container" class="progress-container" style="display: none;">
+                        <div class="progress-bar">
+                            <div id="progress-fill" class="progress-fill"></div>
+                        </div>
+                        <div class="progress-info">
+                            <p id="progress-stage" class="progress-stage">Initializing...</p>
+                            <p id="progress-percentage" class="progress-percentage">0%</p>
+                        </div>
+                        <p id="progress-pois" class="progress-pois">POIs found: <span id="progress-poi-count">0</span></p>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Powered by OpenStreetMap Overpass API</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
