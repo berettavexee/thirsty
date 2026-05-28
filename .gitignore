@@ -3,3 +3,5 @@ venv/
 build/
 thirsty.egg-info/
 thirsty/__pycache__/
+examples/
+ouputs/
