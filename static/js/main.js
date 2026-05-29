@@ -1,6 +1,7 @@
 // Global state
 let uploadedFile = null;
 let currentResultId = null;
+let elevationChart = null;
 
 // DOM Elements
 const dropZone = document.getElementById('drop-zone');
@@ -14,7 +15,7 @@ const uploadSection = document.getElementById('upload-section');
 const resultsSection = document.getElementById('results-section');
 const loadingOverlay = document.getElementById('loading-overlay');
 const mapFrame = document.getElementById('map-frame');
-const poiCountEl = document.getElementById('poi-count');
+const poiBreakdownEl = document.getElementById('poi-breakdown');
 const downloadGpxBtn = document.getElementById('download-gpx');
 const downloadHtmlBtn = document.getElementById('download-html');
 const newSearchBtn = document.getElementById('new-search');
@@ -182,8 +183,32 @@ function displayResults(result) {
 
     currentResultId = result.result_id;
 
-    // Update POI count
-    poiCountEl.textContent = result.poi_count;
+    // Render POI breakdown
+    const breakdown = result.poi_breakdown || {};
+    const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+    if (total === 0) {
+        poiBreakdownEl.innerHTML = '<p class="poi-breakdown-empty">No POIs found near the track.</p>';
+    } else {
+        const rows = Object.entries(breakdown)
+            .sort((a, b) => b[1] - a[1])
+            .map(([label, count]) => `
+                <div class="poi-breakdown-row">
+                    <span class="poi-breakdown-label">${label}</span>
+                    <span class="poi-breakdown-count">${count}</span>
+                </div>`)
+            .join('');
+        poiBreakdownEl.innerHTML = `
+            <div class="poi-breakdown-total">
+                <span>Total</span><span>${total}</span>
+            </div>
+            ${rows}`;
+    }
+
+    // Elevation profile
+    renderElevationProfile(result.elevation_profile || null);
+
+    // Roadbook
+    renderRoadbook(result.elevation_profile?.pois || []);
 
     // Embed map
     const mapDoc = mapFrame.contentDocument || mapFrame.contentWindow.document;
@@ -259,6 +284,249 @@ function updateProgress(data) {
     progressPoiCount.textContent = data.poi_count || 0;
 }
 
+function slopeColor(slope) {
+    if (slope < 0)  return 'rgba(255,255,255,0.9)';
+    if (slope < 4)  return '#4ade80';
+    if (slope < 8)  return '#facc15';
+    if (slope < 12) return '#f97316';
+    return '#ef4444';
+}
+
+function slopeFillColor(slope) {
+    if (slope < 0)  return 'rgba(255,255,255,0.07)';
+    if (slope < 4)  return 'rgba(74,222,128,0.28)';
+    if (slope < 8)  return 'rgba(250,204,21,0.28)';
+    if (slope < 12) return 'rgba(249,115,22,0.28)';
+    return 'rgba(239,68,68,0.28)';
+}
+
+const POI_COLORS = {
+    'Water':             '#60a5fa',
+    'Bakery':            '#4ade80',
+    'Cafe':              '#f87171',
+    'Fuel Station':      '#fb923c',
+    'Convenience Store': '#c084fc',
+    'Vending Machine':   '#f87171',
+};
+
+function stackPois(pois, eleRange) {
+    if (!pois.length) return [];
+    const step = Math.max(10, eleRange / 15);
+    const thresholdKm = 0.5;
+    const sorted = pois.slice().sort((a, b) => a.d - b.d);
+    const result = [];
+    let i = 0;
+    while (i < sorted.length) {
+        let j = i;
+        while (j + 1 < sorted.length && sorted[j + 1].d - sorted[i].d < thresholdKm) j++;
+        for (let k = i; k <= j; k++) {
+            result.push({ ...sorted[k], stackedEle: sorted[k].ele + (k - i) * step });
+        }
+        i = j + 1;
+    }
+    return result;
+}
+
+function renderElevationProfile(profileData) {
+    const section = document.getElementById('elevation-section');
+    if (!profileData) { section.style.display = 'none'; return; }
+    section.style.display = 'block';
+
+    const pts  = profileData.points;
+    const pois = profileData.pois;
+
+    // Slope per segment (%)
+    const slopes = pts.map((p, i) => {
+        if (i === pts.length - 1) return 0;
+        const dDist = (pts[i + 1].d - p.d) * 1000;
+        return dDist > 1 ? ((pts[i + 1].ele - p.ele) / dDist) * 100 : 0;
+    });
+
+    // Stack overlapping POI markers
+    const eles = pts.map(p => p.ele);
+    const eleRange = Math.max(...eles) - Math.min(...eles);
+    const stacked = stackPois(pois, eleRange);
+    const poiColors = stacked.map(p => POI_COLORS[p.type] || '#94a3b8');
+
+    // Legend — only types actually present
+    const presentTypes = [...new Set(stacked.map(p => p.type))];
+    document.getElementById('elevation-legend').innerHTML = presentTypes.map(t =>
+        `<span class="poi-legend-item">
+            <span class="poi-legend-dot" style="background:${POI_COLORS[t] || '#94a3b8'}"></span>
+            ${t}
+        </span>`
+    ).join('');
+
+    const maxDist = pts[pts.length - 1].d;
+
+    // Inline plugin: fills each segment with the slope colour
+    const fillBySlopePlugin = {
+        id: 'fillBySlope',
+        beforeDatasetsDraw(chart) {
+            const { ctx: c, chartArea, scales } = chart;
+            const meta = chart.getDatasetMeta(0);
+            if (!meta?.data.length) return;
+            c.save();
+            c.beginPath();
+            c.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+            c.clip();
+            for (let i = 0; i < meta.data.length - 1; i++) {
+                const p0 = meta.data[i];
+                const p1 = meta.data[i + 1];
+                c.beginPath();
+                c.moveTo(p0.x, chartArea.bottom);
+                c.lineTo(p0.x, p0.y);
+                c.lineTo(p1.x, p1.y);
+                c.lineTo(p1.x, chartArea.bottom);
+                c.closePath();
+                c.fillStyle = slopeFillColor(slopes[i]);
+                c.fill();
+            }
+            c.restore();
+        },
+    };
+
+    if (elevationChart) elevationChart.destroy();
+    document.getElementById('elevation-reset').onclick = () => elevationChart?.resetZoom();
+    const ctx = document.getElementById('elevation-canvas').getContext('2d');
+
+    elevationChart = new Chart(ctx, {
+        plugins: [fillBySlopePlugin],
+        data: {
+            datasets: [
+                {
+                    type: 'line',
+                    label: 'Elevation',
+                    data: pts.map(p => ({ x: p.d, y: p.ele })),
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.2,
+                    fill: false,
+                    segment: { borderColor: c => slopeColor(slopes[c.p0DataIndex]) },
+                    order: 2,
+                },
+                {
+                    type: 'scatter',
+                    label: 'POIs',
+                    data: stacked.map(p => ({ x: p.d, y: p.stackedEle, name: p.name, type: p.type, origEle: p.ele })),
+                    pointStyle: 'circle',
+                    pointRadius: 6,
+                    pointHoverRadius: 9,
+                    backgroundColor: poiColors,
+                    borderColor: 'rgba(255,255,255,0.8)',
+                    borderWidth: 1.5,
+                    order: 1,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'nearest', intersect: false, axis: 'x' },
+            plugins: {
+                legend: { display: false },
+                zoom: {
+                    limits: {
+                        x: { min: 0, max: maxDist, minRange: 0.5 },
+                    },
+                    zoom: {
+                        wheel: { enabled: true },
+                        pinch: { enabled: true },
+                        mode: 'x',
+                    },
+                    pan: {
+                        enabled: true,
+                        mode: 'x',
+                    },
+                },
+                tooltip: {
+                    callbacks: {
+                        title: items => `${Number(items[0].parsed.x).toFixed(1)} km`,
+                        label: item => {
+                            if (item.datasetIndex === 0) {
+                                const s = slopes[item.dataIndex];
+                                return `${item.parsed.y} m  |  pente : ${s.toFixed(1)} %`;
+                            }
+                            const poi = stacked[item.dataIndex];
+                            const name = poi.name || '(sans nom)';
+                            return `${poi.type} — ${name}  (${poi.origEle} m)`;
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: 0,
+                    max: maxDist,
+                    title: { display: true, text: 'Distance (km)', color: '#aaa' },
+                    ticks: { color: '#aaa' },
+                    grid: { color: 'rgba(255,255,255,0.07)' },
+                },
+                y: {
+                    title: { display: true, text: 'Élévation (m)', color: '#aaa' },
+                    ticks: { color: '#aaa' },
+                    grid: { color: 'rgba(255,255,255,0.07)' },
+                },
+            },
+        },
+    });
+}
+
+function groupPoisByDistance(pois, thresholdKm = 0.5) {
+    const sorted = pois.slice().sort((a, b) => a.d - b.d);
+    const groups = [];
+    let i = 0;
+    while (i < sorted.length) {
+        const group = [sorted[i]];
+        let j = i + 1;
+        while (j < sorted.length && sorted[j].d - sorted[i].d < thresholdKm) {
+            group.push(sorted[j]);
+            j++;
+        }
+        groups.push(group);
+        i = j;
+    }
+    return groups;
+}
+
+function renderRoadbook(pois) {
+    const section = document.getElementById('roadbook-section');
+    const tbody   = document.getElementById('roadbook-body');
+
+    if (!pois || !pois.length) { section.style.display = 'none'; return; }
+
+    section.style.display = 'block';
+    const groups = groupPoisByDistance(pois);
+
+    tbody.innerHTML = groups.map(group => {
+        const first = group[0];
+
+        const cities = [...new Set(group.map(p => p.city).filter(Boolean))];
+        const cityHtml = cities.length
+            ? `<span class="roadbook-city">${cities.join(', ')}</span>`
+            : '';
+
+        const typesCells = group.map(poi => {
+            const color = POI_COLORS[poi.type] || '#94a3b8';
+            return `<span class="roadbook-type-entry">
+                        <span class="poi-legend-dot" style="background:${color}"></span>${poi.type}
+                    </span>`;
+        }).join('');
+
+        const namesCells = group.map(poi =>
+            poi.name || '<em>sans nom</em>'
+        ).join('<br>');
+
+        return `<tr>
+            <td class="roadbook-dist">${first.d.toFixed(1)} km${cityHtml}</td>
+            <td class="roadbook-ele">${first.ele} m</td>
+            <td class="roadbook-type">${typesCells}</td>
+            <td class="roadbook-name">${namesCells}</td>
+        </tr>`;
+    }).join('');
+}
+
 function showError(message) {
     const errorDiv = document.getElementById('error-message');
     const errorText = document.getElementById('error-text');
@@ -304,6 +572,11 @@ function setButtonLoading(button, loading) {
         button.disabled = false;
     }
 }
+
+// Max distance slider live value
+document.getElementById('max-distance').addEventListener('input', (e) => {
+    document.getElementById('max-distance-value').textContent = e.target.value;
+});
 
 // Add smooth animations on page load
 document.addEventListener('DOMContentLoaded', () => {

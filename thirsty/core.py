@@ -161,6 +161,68 @@ def _poi_type_label(poi: dict) -> str:
     return "Type inconnu"
 
 
+def compute_elevation_profile(
+    gpx: gpxpy.gpx.GPX,
+    pois: list[dict],
+) -> dict | None:
+    """Compute a sampled elevation profile and POI positions along the track.
+
+    Args:
+        gpx: Parsed GPX object. Returns None if no elevation data is available.
+        pois: Filtered POI list; each POI is projected onto the nearest track point.
+
+    Returns:
+        Dict with keys 'points' (sampled profile) and 'pois' (markers), or None.
+    """
+    raw: list[tuple[float, float, float]] = []
+    for trk in gpx.tracks:
+        for seg in trk.segments:
+            for pt in seg.points:
+                if pt.elevation is not None:
+                    raw.append((pt.latitude, pt.longitude, pt.elevation))
+
+    if len(raw) < 2:
+        return None
+
+    # Cumulative distance in metres
+    cum_dist = [0.0]
+    for i in range(1, len(raw)):
+        cum_dist.append(cum_dist[-1] + haversine(
+            raw[i - 1][0], raw[i - 1][1],
+            raw[i][0], raw[i][1],
+        ))
+
+    total_m = cum_dist[-1]
+    step_m = max(50.0, total_m / 1000)
+
+    # Sample ~1000 points evenly by distance
+    profile: list[dict] = []
+    next_target = 0.0
+    for i, (_, _, ele) in enumerate(raw):
+        if cum_dist[i] >= next_target:
+            profile.append({"d": round(cum_dist[i] / 1000, 3), "ele": round(ele, 1)})
+            next_target += step_m
+    last_d = round(total_m / 1000, 3)
+    if not profile or profile[-1]["d"] < last_d:
+        profile.append({"d": last_d, "ele": round(raw[-1][2], 1)})
+
+    # Project each POI onto the nearest track point using a KDTree
+    coords_2d = [(lat, lon) for lat, lon, _ in raw]
+    kd = KDTree(coords_2d)
+    markers: list[dict] = []
+    for poi in pois:
+        _, idx = kd.query([poi["lat"], poi["lon"]])
+        markers.append({
+            "d":    round(cum_dist[idx] / 1000, 3),
+            "ele":  round(raw[idx][2], 1),
+            "name": poi["tags"].get("name", ""),
+            "type": _poi_type_label(poi),
+            "city": poi["tags"].get("addr:city", ""),
+        })
+
+    return {"points": profile, "pois": markers}
+
+
 def display_gpx_on_map(
     data: gpxpy.gpx.GPX,
     pois: list[dict],
@@ -190,11 +252,11 @@ def display_gpx_on_map(
                         for segment in track.segments
                         for point in segment.points]
 
-    center_lat = sum(track_latitudes) / len(track_latitudes)
-    center_lon = sum(track_longitudes) / len(track_longitudes)
-
-    map_center = [center_lat, center_lon]
-    folium_map = folium.Map(location=map_center, zoom_start=12)
+    folium_map = folium.Map()
+    folium_map.fit_bounds([
+        [min(track_latitudes), min(track_longitudes)],
+        [max(track_latitudes), max(track_longitudes)],
+    ])
     LocateControl(auto_start=False).add_to(folium_map)
 
     # Plot the GPX track on the map

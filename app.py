@@ -152,13 +152,23 @@ def upload_file():
                     'html_filename': output_html_filename
                 }
                 
+                poi_breakdown = {}
+                for poi in filtered_pois:
+                    label = thirsty.core._poi_type_label(poi)
+                    poi_breakdown[label] = poi_breakdown.get(label, 0) + 1
+
+                elevation_profile = thirsty.core.compute_elevation_profile(
+                    gpx_original, filtered_pois
+                )
+
                 # Send completion message
                 if session_id in progress_queues:
                     progress_queues[session_id].put({
                         'complete': True,
                         'success': True,
                         'result_id': result_id,
-                        'poi_count': len(filtered_pois),
+                        'poi_breakdown': poi_breakdown,
+                        'elevation_profile': elevation_profile,
                         'map_html': map_html_content,
                         'gpx_filename': output_gpx_filename,
                         'html_filename': output_html_filename
