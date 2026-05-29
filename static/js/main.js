@@ -97,7 +97,7 @@ configForm.addEventListener('submit', async (e) => {
         return;
     }
 
-    // Show loading state
+    hideError();
     showLoading(true);
     setButtonLoading(processBtn, true);
 
@@ -131,25 +131,25 @@ configForm.addEventListener('submit', async (e) => {
             const data = JSON.parse(event.data);
 
             if (data.complete) {
-                // Processing complete
                 eventSource.close();
 
                 if (data.success) {
-                    // Display results
                     displayResults(data);
                 } else {
-                    // Show error
-                    throw new Error(data.error || 'Processing failed');
+                    showLoading(false);
+                    setButtonLoading(processBtn, false);
+                    showError(data.error || 'Processing failed');
                 }
             } else {
-                // Update progress
                 updateProgress(data);
             }
         };
 
-        eventSource.onerror = (error) => {
-            console.error('EventSource error:', error);
+        eventSource.onerror = () => {
             eventSource.close();
+            showLoading(false);
+            setButtonLoading(processBtn, false);
+            showError('Connection lost. Please try again.');
         };
 
         // Send upload request (processing happens in background)
@@ -168,14 +168,10 @@ configForm.addEventListener('submit', async (e) => {
 
     } catch (error) {
         console.error('Error:', error);
-        alert('Error processing GPX file: ' + error.message);
-
-        if (eventSource) {
-            eventSource.close();
-        }
-
+        if (eventSource) eventSource.close();
         showLoading(false);
         setButtonLoading(processBtn, false);
+        showError(error.message || 'An unexpected error occurred.');
     }
 });
 
@@ -261,6 +257,19 @@ function updateProgress(data) {
 
     // Update POI count
     progressPoiCount.textContent = data.poi_count || 0;
+}
+
+function showError(message) {
+    const errorDiv = document.getElementById('error-message');
+    const errorText = document.getElementById('error-text');
+    errorText.textContent = message;
+    errorDiv.style.display = 'block';
+    errorDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    resetFileUpload();
+}
+
+function hideError() {
+    document.getElementById('error-message').style.display = 'none';
 }
 
 function showLoading(show) {
