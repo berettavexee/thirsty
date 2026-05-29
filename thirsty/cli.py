@@ -35,24 +35,6 @@ def main():
         default=100,
         help="Maximum distance in meters from the GPX track to consider a POI. Default: 100.",
     )
-    parser.add_argument(
-        "--max-bbox-area",
-        type=float,
-        default=0.5,
-        help="Maximum area in square degrees for an Overpass query bounding box before subdivision. Default: 0.5.",
-    )
-    parser.add_argument(
-        "--lat-divisions",
-        type=int,
-        default=2,
-        help="Number of latitude divisions when subdividing a large bounding box. Default: 2.",
-    )
-    parser.add_argument(
-        "--lon-divisions",
-        type=int,
-        default=2,
-        help="Number of longitude divisions when subdividing a large bounding box. Default: 2.",
-    )
     parser.add_argument(  # Nouvel argument pour afficher les BBoxes
         "--show-bboxes",
         action="store_true",
@@ -86,10 +68,7 @@ def main():
             gpx_content,
             args.poi_type,
             args.max_distance,
-            args.max_bbox_area,
-            args.lat_divisions,
-            args.lon_divisions,
-            args.show_bboxes  # Passer la valeur de show_bboxes
+            args.show_bboxes,
         )
     except Exception as e:
         console.print(

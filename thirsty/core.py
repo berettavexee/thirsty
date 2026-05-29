@@ -69,6 +69,13 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.private.coffee/api/interpreter"
 ]
 
+# overpass-api.de requires applications to identify themselves.
+# https://wiki.openstreetmap.org/wiki/Overpass_API
+OVERPASS_HEADERS = {
+    "User-Agent": "thirsty/0.1.0 (https://github.com/berettavexee/thirsty)",
+    "Referer": "https://github.com/berettavexee/thirsty",
+}
+
 # Approximate degrees per meter at mid-latitudes (111.32 km/degree).
 APPROX_DEGREES_PER_METER = 1 / 111320.0
 
@@ -79,6 +86,11 @@ _KDTREE_SEARCH_MARGIN = 1.05
 _BBOX_DILATION_FACTOR = 0.05
 # Additional radius factor for the KDTree ball query inside bbox containment check.
 _KDTREE_BBOX_RADIUS_MARGIN = 1.1
+
+# Fixed tile size in degrees for the Overpass query grid.
+# Tiles are aligned to a global grid (multiples of TILE_SIZE_DEG), so any two
+# routes crossing the same area produce identical tile coordinates and hit the cache.
+TILE_SIZE_DEG = 0.5
 
 # (south, west, north, east) in decimal degrees
 Bbox = tuple[float, float, float, float]
@@ -291,31 +303,6 @@ def get_bounds(gpx: gpxpy.gpx.GPX, max_distance_m: float) -> Bbox | None:
     return min_lat, min_lon, max_lat, max_lon
 
 
-def _subdivide_bbox(bbox: Bbox, lat_divisions: int, lon_divisions: int) -> list[Bbox]:
-    """Subdivide a bounding box into a lat_divisions × lon_divisions grid.
-
-    Args:
-        bbox: (south, west, north, east) bounding box to split.
-        lat_divisions: Number of rows (latitude cuts).
-        lon_divisions: Number of columns (longitude cuts).
-
-    Returns:
-        List of sub-bboxes in row-major order.
-    """
-    south, west, north, east = bbox
-    sub_bboxes = []
-
-    lat_step = (north - south) / lat_divisions
-    lon_step = (east - west) / lon_divisions
-
-    for i in range(lat_divisions):
-        for j in range(lon_divisions):
-            sub_south = south + i * lat_step
-            sub_north = south + (i + 1) * lat_step
-            sub_west = west + j * lon_step
-            sub_east = west + (j + 1) * lon_step
-            sub_bboxes.append((sub_south, sub_west, sub_north, sub_east))
-    return sub_bboxes
 
 
 def _bbox_contains_gpx_points(
@@ -358,46 +345,44 @@ def _bbox_contains_gpx_points(
     return False
 
 
-def get_relevant_bboxes(
+def get_tiles(
     bbox: Bbox,
     gpx_kdtree: KDTree,
     gpx_points_coords: list[tuple[float, float]],
-    max_bbox_area_sq_deg: float = 0.5,
-    lat_divisions: int = 2,
-    lon_divisions: int = 2,
 ) -> list[Bbox]:
-    """Recursively subdivide bbox and return only the leaves that intersect the GPX track.
+    """Return all TILE_SIZE_DEG × TILE_SIZE_DEG fixed-grid tiles that intersect the GPX track.
 
-    Bboxes smaller than max_bbox_area_sq_deg are returned as-is (leaf nodes).
-    Larger ones are split into a lat_divisions × lon_divisions grid and each
-    child is tested recursively. Bboxes with no GPX points are discarded early.
+    Tiles are aligned to a global grid (coordinates are integer multiples of TILE_SIZE_DEG),
+    so identical geographic areas always produce identical tile coordinates regardless of the
+    GPX trace shape. This maximises Overpass response cache hits across different routes.
 
     Args:
-        bbox: (south, west, north, east) root bounding box to process.
-        gpx_kdtree: KDTree built from gpx_points_coords.
+        bbox: (south, west, north, east) overall bounding box to cover.
+        gpx_kdtree: KDTree built from gpx_points_coords for fast spatial lookup.
         gpx_points_coords: List of (lat, lon) tuples of all GPX track points.
-        max_bbox_area_sq_deg: Area threshold in square degrees below which a bbox is queried directly.
-        lat_divisions: Number of latitude splits when subdividing.
-        lon_divisions: Number of longitude splits when subdividing.
 
     Returns:
-        List of leaf bboxes that overlap the GPX track and should be sent to Overpass.
+        Tiles that contain at least one GPX track point, ready to be sent to Overpass.
     """
     south, west, north, east = bbox
-    current_bbox_area = (north - south) * (east - west)
 
-    if not _bbox_contains_gpx_points(bbox, gpx_kdtree, gpx_points_coords):
-        return []
+    i_south = math.floor(south / TILE_SIZE_DEG)
+    i_west = math.floor(west / TILE_SIZE_DEG)
+    i_north = math.ceil(north / TILE_SIZE_DEG)
+    i_east = math.ceil(east / TILE_SIZE_DEG)
 
-    if current_bbox_area <= max_bbox_area_sq_deg:
-        return [bbox]
-    
-    sub_bboxes = _subdivide_bbox(bbox, lat_divisions, lon_divisions)
-    bboxes = []
-    for sub_bbox in sub_bboxes:
-        bboxes.extend(get_relevant_bboxes(sub_bbox, gpx_kdtree, gpx_points_coords,
-                      max_bbox_area_sq_deg, lat_divisions, lon_divisions))
-    return bboxes
+    tiles = []
+    for i in range(i_south, i_north):
+        for j in range(i_west, i_east):
+            tile: Bbox = (
+                i * TILE_SIZE_DEG,
+                j * TILE_SIZE_DEG,
+                (i + 1) * TILE_SIZE_DEG,
+                (j + 1) * TILE_SIZE_DEG,
+            )
+            if _bbox_contains_gpx_points(tile, gpx_kdtree, gpx_points_coords):
+                tiles.append(tile)
+    return tiles
 
 
 def query_overpass(bbox: Bbox, poi_types: list[str], gpx_kdtree: KDTree) -> list[dict]:
@@ -433,24 +418,36 @@ def query_overpass(bbox: Bbox, poi_types: list[str], gpx_kdtree: KDTree) -> list
         return cached
 
     max_retries = len(OVERPASS_ENDPOINTS) * 2
-    retry_delay = 5  # secondes
-    success_delay = 2 # secondes
+    retry_delay = 5
+    success_delay = 2
 
     for attempt in range(1, max_retries + 1):
-        # Cycle through endpoints
         endpoint = OVERPASS_ENDPOINTS[(attempt - 1) % len(OVERPASS_ENDPOINTS)]
 
         try:
             console.print(f"Appel {attempt} : {endpoint} : {escape(query)}")
-            response = requests.post(endpoint, data=query, timeout=95)
+            response = requests.post(endpoint, data=query, headers=OVERPASS_HEADERS, timeout=95)
+
+            if response.status_code == 429:
+                wait = int(response.headers.get("Retry-After", retry_delay * 2))
+                console.print(f"[bold yellow]Rate limit (429) sur {endpoint}, attente {wait}s...[/bold yellow]")
+                time.sleep(wait)
+                continue
+
             response.raise_for_status()
 
-            elements = response.json().get("elements", [])
+            data = response.json()
+            remark = data.get("remark")
+            if remark:
+                console.print(f"[bold yellow]Overpass remark sur {endpoint}: {remark}[/bold yellow]")
+                raise ValueError(f"Overpass server error: {remark}")
+
+            elements = data.get("elements", [])
             _save_cache(query, elements)
             time.sleep(success_delay)
             return elements
 
-        except (requests.exceptions.RequestException, requests.exceptions.Timeout, ValueError) as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             console.print(f"[bold yellow]Tentative {attempt} échouée sur {endpoint}: {e}[/bold yellow]")
 
             if attempt < max_retries:
@@ -458,7 +455,7 @@ def query_overpass(bbox: Bbox, poi_types: list[str], gpx_kdtree: KDTree) -> list
                 time.sleep(retry_delay)
             else:
                 console.print(f"[bold red]Erreur définitive après {max_retries} essais sur tous les serveurs.[/bold red]")
-                raise e
+                raise
 
 
 def add_waypoints_to_gpx(gpx: gpxpy.gpx.GPX, pois: list[dict]) -> gpxpy.gpx.GPX:
@@ -572,30 +569,27 @@ def process_gpx_and_pois(
     gpx_content: str,
     poi_types: list[str],
     max_distance_m: float,
-    max_bbox_area_sq_deg: float,
-    lat_divisions: int,
-    lon_divisions: int,
     show_bboxes: bool = False,
     progress_callback: callable | None = None,
 ) -> tuple[gpxpy.gpx.GPX, list[dict], list[Bbox]]:
     """Orchestrate the full pipeline: parse GPX → query Overpass → deduplicate → filter.
 
+    Overpass queries use a fixed TILE_SIZE_DEG × TILE_SIZE_DEG grid so that cache hits
+    are maximised across different routes covering the same geographic area.
+
     Args:
         gpx_content: Raw GPX file content as a string.
         poi_types: List of AMENITIES keys to search for.
         max_distance_m: Maximum distance in metres from the track to retain a POI.
-        max_bbox_area_sq_deg: Overpass bboxes larger than this (in square degrees) are subdivided.
-        lat_divisions: Number of latitude splits when subdividing a large bbox.
-        lon_divisions: Number of longitude splits when subdividing a large bbox.
-        show_bboxes: When True, the returned bbox list is populated; otherwise it is empty.
+        show_bboxes: When True, the returned tile list is populated; otherwise it is empty.
         progress_callback: Optional callable(dict) receiving progress updates with keys
                            'stage', 'current', 'total', 'poi_count'.
 
     Returns:
-        Tuple (gpx, filtered_pois, queried_bboxes):
+        Tuple (gpx, filtered_pois, queried_tiles):
             - gpx: Parsed gpxpy.GPX object (track only, no waypoints yet).
             - filtered_pois: POIs within max_distance_m of the track.
-            - queried_bboxes: Bboxes sent to Overpass (empty if show_bboxes is False).
+            - queried_tiles: Tiles sent to Overpass (empty if show_bboxes is False).
     """
     # Helper function to safely call progress callback
     def report_progress(stage, current=0, total=0, poi_count=0):
@@ -643,28 +637,19 @@ def process_gpx_and_pois(
     console.print("KDTree built.")
 
     console.print(f"Searching for POIs of type(s): {', '.join(poi_types)}")
-    console.print(f"Maximum bbox area: {max_bbox_area_sq_deg} sq deg (subdivision factor: {lat_divisions}x{lon_divisions})")
+    console.print(f"Tile size: {TILE_SIZE_DEG}°")
 
-    # Find relevant bboxes
-    report_progress('Calculating bounding boxes', 1, 5, 0)
-    bboxes = get_relevant_bboxes(
-        bounds,
-        gpx_kdtree,
-        track_points_coords,
-        max_bbox_area_sq_deg,
-        lat_divisions,
-        lon_divisions
-    )
-    total_overpass_steps = len(bboxes)
-    console.print(
-        f"Calculated {total_overpass_steps} Overpass query/skip steps.")
+    report_progress('Calculating tiles', 1, 5, 0)
+    bboxes = get_tiles(bounds, gpx_kdtree, track_points_coords)
+    console.print(f"{len(bboxes)} tiles to query.")
 
     collected_bboxes = bboxes if show_bboxes else []
 
     # Stage 2: Find POIs
+    total_tiles = len(bboxes)
     pois = []
     for idx, bbox in enumerate(bboxes):
-        report_progress('Querying Overpass API', idx + 1, total_overpass_steps, len(pois))
+        report_progress('Querying Overpass API', idx + 1, total_tiles, len(pois))
         pois.extend(query_overpass(bbox, poi_types, gpx_kdtree))
 
     console.print(f"Total raw POIs found by Overpass: {len(pois)}")

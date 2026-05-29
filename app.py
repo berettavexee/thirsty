@@ -89,9 +89,6 @@ def upload_file():
             poi_types = list(thirsty.core.AMENITIES.keys())
         
         max_distance = int(request.form.get('max_distance', 100))
-        max_bbox_area = float(request.form.get('max_bbox_area', 0.5))
-        lat_divisions = int(request.form.get('lat_divisions', 2))
-        lon_divisions = int(request.form.get('lon_divisions', 2))
         show_bboxes = request.form.get('show_bboxes', 'false') == 'true'
         
         # Generate session ID
@@ -118,11 +115,8 @@ def upload_file():
                     gpx_content,
                     poi_types,
                     max_distance,
-                    max_bbox_area,
-                    lat_divisions,
-                    lon_divisions,
                     show_bboxes,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
                 )
                 
                 output_gpx_filename = f"{base_name}_with_pois.gpx"
@@ -136,9 +130,9 @@ def upload_file():
                 
                 # Generate and save HTML map
                 map_html = thirsty.core.display_gpx_on_map(
-                    gpx_original, 
-                    filtered_pois, 
-                    collected_bboxes if show_bboxes else None
+                    gpx_original,
+                    filtered_pois,
+                    collected_bboxes,
                 )
                 output_html_path = os.path.join(app.config['OUTPUT_FOLDER'], output_html_filename)
                 map_html.save(output_html_path)

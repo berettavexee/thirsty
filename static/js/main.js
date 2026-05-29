@@ -122,9 +122,6 @@ configForm.addEventListener('submit', async (e) => {
 
         // Get other parameters
         formData.append('max_distance', document.getElementById('max-distance').value);
-        formData.append('max_bbox_area', document.getElementById('max-bbox-area').value);
-        formData.append('lat_divisions', document.getElementById('lat-divisions').value);
-        formData.append('lon_divisions', document.getElementById('lon-divisions').value);
         formData.append('show_bboxes', document.getElementById('show-bboxes').checked);
 
         // Set up EventSource for progress updates
